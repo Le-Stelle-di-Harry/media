@@ -1,0 +1,56 @@
+name: Riprova server
+
+# Tenta di creare il server ogni 15 minuti finché non ci riesce, poi si disattiva da solo.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: riprova
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+
+jobs:
+  tenta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - name: Installa CLI
+        run: pip install -q oci-cli > /dev/null 2>&1
+      - name: Tentativo
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=~/.oci/key.pem\n' \
+            "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" "$OCI_REGION" > ~/.oci/config
+          chmod 600 ~/.oci/config
+          export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          STACK=$(oci resource-manager stack list -c "$OCI_TENANCY" --all --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$STACK" ]; then echo "esito: stack non trovato (credenziali?)"; exit 1; fi
+          OUT=$(oci resource-manager job create-apply-job --stack-id "$STACK" \
+            --execution-plan-strategy AUTO_APPROVED \
+            --wait-for-state SUCCEEDED --wait-for-state FAILED --max-wait-seconds 720 \
+            --query 'data."lifecycle-state"' --raw-output 2>&1)
+          STATO=$(echo "$OUT" | tail -1)
+          case "$STATO" in
+            SUCCEEDED)
+              echo "esito: RIUSCITO"
+              curl -s -H "Title: Server Oracle creato" -H "Priority: 5" -d "Il server stelle-server esiste: si passa alla migrazione." "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+              gh workflow disable riprova-oracle.yml -R "$GITHUB_REPOSITORY"
+              ;;
+            FAILED) echo "esito: niente capacità, riprovo tra 15 minuti" ;;
+            *) echo "esito: errore $(echo "$OUT" | grep -oE '"code": "[^"]*"' | head -1)" ;;
+          esac
