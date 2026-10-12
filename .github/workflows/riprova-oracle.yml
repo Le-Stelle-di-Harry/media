@@ -31,8 +31,7 @@ jobs:
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
           chmod 600 ~/.oci/key.pem
-          printf '%s\n' "$OCI_CONFIG" | tr -d '\r' | grep -v '^key_file' > ~/.oci/config
-          echo "key_file=~/.oci/key.pem" >> ~/.oci/config
+          python3 -c 'import os,re; c=os.environ["OCI_CONFIG"]; v={k: re.search(k+r"\s*=\s*(\S+)", c).group(1) for k in ("user","fingerprint","tenancy","region")}; open(os.path.expanduser("~/.oci/config"),"w").write("[DEFAULT]\n"+"".join(f"{k}={x}\n" for k,x in v.items())+"key_file=~/.oci/key.pem\n")'
           OCI_TENANCY=$(grep '^tenancy=' ~/.oci/config | cut -d= -f2 | tr -d ' ')
           chmod 600 ~/.oci/config
           export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
