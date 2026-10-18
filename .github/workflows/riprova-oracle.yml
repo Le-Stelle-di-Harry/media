@@ -1,9 +1,9 @@
 name: Riprova server
 
-# Tenta di creare il server ogni 15 minuti finché non ci riesce, poi si disattiva da solo.
+# Un solo tentativo per avvio. Lo avvia cron-job.org una volta l'ora
+# (niente schedule di GitHub: salta i giri e piu' richieste fanno scattare il blocco di Oracle).
+# Quando il server nasce: avviso su ntfy con l'IP e il workflow si disattiva da solo.
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -20,6 +20,7 @@ jobs:
     steps:
       - name: Installa CLI
         run: pip install -q oci-cli > /dev/null 2>&1
+
       - name: Tentativo
         env:
           OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
@@ -28,26 +29,59 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set +x
+          esito() {  # scrive l'esito in chiaro nel riepilogo del giro
+            echo "esito: $1"
+            echo "### $1" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Esito::$1"
+          }
+
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
           chmod 600 ~/.oci/key.pem
           python3 -c 'import os,re; c=os.environ["OCI_CONFIG"]; v={k: re.search(k+r"\s*=\s*(\S+)", c).group(1) for k in ("user","fingerprint","tenancy","region")}; open(os.path.expanduser("~/.oci/config"),"w").write("[DEFAULT]\n"+"".join(f"{k}={x}\n" for k,x in v.items())+"key_file=~/.oci/key.pem\n")'
-          OCI_TENANCY=$(grep '^tenancy=' ~/.oci/config | cut -d= -f2 | tr -d ' ')
           chmod 600 ~/.oci/config
           export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
-          STACK=$(oci resource-manager stack list -c "$OCI_TENANCY" --all --query 'data[0].id' --raw-output 2>/dev/null)
-          if [ -z "$STACK" ]; then echo "esito: stack non trovato (credenziali?)"; exit 1; fi
+          T=$(grep '^tenancy=' ~/.oci/config | cut -d= -f2 | tr -d ' ')
+
+          # 1) Esiste gia' un'istanza viva? Allora non si tenta niente.
+          VIVE=$(oci compute instance list -c "$T" --all \
+            --query 'length(data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`])' \
+            --raw-output 2>&1)
+          if echo "$VIVE" | grep -qiE 'NotAuthenticated|401'; then esito "❌ credenziali Oracle non valide"; exit 0; fi
+          if echo "$VIVE" | grep -qiE 'TooManyRequests|429'; then esito "⏳ troppe richieste, riprovo al prossimo giro"; exit 0; fi
+          if [ "$VIVE" != "0" ] && [ -n "$VIVE" ] && [ "$VIVE" -eq "$VIVE" ] 2>/dev/null; then
+            esito "✅ istanza gia' presente, workflow disattivato"
+            gh workflow disable riprova-oracle.yml -R "$GITHUB_REPOSITORY"
+            exit 0
+          fi
+
+          # 2) Un solo tentativo: applica lo stack stelle-server.
+          STACK=$(oci resource-manager stack list -c "$T" --all --query 'data[0].id' --raw-output 2>/dev/null)
+          if [ -z "$STACK" ]; then esito "❌ stack non trovato (credenziali?)"; exit 0; fi
           OUT=$(oci resource-manager job create-apply-job --stack-id "$STACK" \
             --execution-plan-strategy AUTO_APPROVED \
-            --wait-for-state SUCCEEDED --wait-for-state FAILED --max-wait-seconds 720 \
-            --query 'data."lifecycle-state"' --raw-output 2>&1)
-          STATO=$(echo "$OUT" | tail -1)
+            --wait-for-state SUCCEEDED --wait-for-state FAILED --max-wait-seconds 720 2>&1)
+          if echo "$OUT" | grep -qiE 'TooManyRequests|"status": 429'; then esito "⏳ troppe richieste, riprovo al prossimo giro"; exit 0; fi
+          JOB=$(echo "$OUT" | python3 -c 'import sys,json; t=sys.stdin.read(); i=t.find("{"); print(json.loads(t[i:])["data"]["id"] if i>=0 else "")' 2>/dev/null)
+          STATO=$(echo "$OUT" | python3 -c 'import sys,json; t=sys.stdin.read(); i=t.find("{"); print(json.loads(t[i:])["data"]["lifecycle-state"] if i>=0 else "")' 2>/dev/null)
+
           case "$STATO" in
             SUCCEEDED)
-              echo "esito: RIUSCITO"
-              curl -s -H "Title: Server Oracle creato" -H "Priority: 5" -d "Il server stelle-server esiste: si passa alla migrazione." "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+              IP=$(oci compute instance list -c "$T" --all --lifecycle-state RUNNING --query 'data[0].id' --raw-output 2>/dev/null \
+                | xargs -r -I{} oci compute instance list-vnics --instance-id {} --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+              esito "✅ SERVER CREATO (IP ${IP:-da leggere in console})"
+              curl -s -H "Title: Server Oracle creato" -H "Priority: 5" \
+                -d "stelle-server esiste. IP: ${IP:-da leggere in console}. Riprova disattivata." \
+                "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
               gh workflow disable riprova-oracle.yml -R "$GITHUB_REPOSITORY"
               ;;
-            FAILED) echo "esito: niente capacità, riprovo tra 15 minuti" ;;
-            *) echo "esito: errore $(echo "$OUT" | grep -oE '"code": "[^"]*"' | head -1)" ;;
+            FAILED)
+              LOG=$(oci resource-manager job get-job-logs --job-id "$JOB" --all 2>/dev/null)
+              if echo "$LOG" | grep -qi 'Out of host capacity'; then esito "🔁 niente capacita' a Milano, riprovo tra un'ora"
+              elif echo "$LOG" | grep -qiE 'TooManyRequests|429'; then esito "⏳ troppe richieste, riprovo al prossimo giro"
+              elif echo "$LOG" | grep -qiE 'LimitExceeded|limit'; then esito "❌ limite Always Free superato (controllare istanze/dischi)"
+              else esito "❌ tentativo fallito per un altro motivo: $(echo "$LOG" | grep -oiE 'Error: [^\"]{0,120}' | head -1)"
+              fi
+              ;;
+            *) esito "❌ risposta inattesa da Oracle: $(echo "$OUT" | grep -oE '"code": "[^"]*"' | head -1)" ;;
           esac
