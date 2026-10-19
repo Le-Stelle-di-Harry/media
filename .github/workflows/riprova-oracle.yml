@@ -29,6 +29,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set +x
+          set +e   # gli errori li gestiamo noi: niente uscite silenziose
           esito() {  # scrive l'esito in chiaro nel riepilogo del giro
             echo "esito: $1"
             echo "### $1" >> "$GITHUB_STEP_SUMMARY"
@@ -60,10 +61,13 @@ jobs:
           if [ -z "$STACK" ]; then esito "❌ stack non trovato (credenziali?)"; exit 0; fi
           OUT=$(oci resource-manager job create-apply-job --stack-id "$STACK" \
             --execution-plan-strategy AUTO_APPROVED \
-            --wait-for-state SUCCEEDED --wait-for-state FAILED --max-wait-seconds 720 2>&1)
-          if echo "$OUT" | grep -qiE 'TooManyRequests|"status": 429'; then esito "⏳ troppe richieste, riprovo al prossimo giro"; exit 0; fi
-          JOB=$(echo "$OUT" | python3 -c 'import sys,json; t=sys.stdin.read(); i=t.find("{"); print(json.loads(t[i:])["data"]["id"] if i>=0 else "")' 2>/dev/null)
-          STATO=$(echo "$OUT" | python3 -c 'import sys,json; t=sys.stdin.read(); i=t.find("{"); print(json.loads(t[i:])["data"]["lifecycle-state"] if i>=0 else "")' 2>/dev/null)
+            --wait-for-state SUCCEEDED --wait-for-state FAILED --max-wait-seconds 720 2>/tmp/oci_err.txt)
+          ERR=$(cat /tmp/oci_err.txt)
+          if echo "$OUT $ERR" | grep -qiE 'TooManyRequests|"status": 429'; then esito "⏳ troppe richieste, riprovo al prossimo giro"; exit 0; fi
+          leggi() { echo "$OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['$1'])" 2>/dev/null || true; }
+          JOB=$(leggi id)
+          STATO=$(leggi lifecycle-state)
+          OUT="$OUT $ERR"
 
           case "$STATO" in
             SUCCEEDED)
